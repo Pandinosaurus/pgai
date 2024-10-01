@@ -1296,12 +1296,14 @@ begin
 
     select count(*) > 0 into strict _found
     from pg_catalog.pg_class k
-    inner join pg_catalog.pg_namespace n on (k.relnamespace = n.oid)
-    inner join pg_catalog.pg_attribute a on (k.oid = a.attrelid)
+    inner join pg_catalog.pg_namespace n on (k.relnamespace operator(pg_catalog.=) n.oid)
+    inner join pg_catalog.pg_attribute a on (k.oid operator(pg_catalog.=) a.attrelid)
+    inner join pg_catalog.pg_type y on (a.atttypid operator(pg_catalog.=) y.oid)
     where n.nspname operator(pg_catalog.=) source_schema
     and k.relname operator(pg_catalog.=) source_table
     and a.attnum operator(pg_catalog.>) 0
     and a.attname operator(pg_catalog.=) _chunk_column
+    and y.typname in ('text', 'varchar', 'char', 'bpchar')
     ;
     if not _found then
         raise exception 'chunk column in config does not exist in the table: %', _chunk_column;
@@ -2378,8 +2380,23 @@ begin
     commit;
     set local search_path = pg_catalog, pg_temp;
     if _found is not null then
-        -- execute the vectorizer
-        perform ai.execute_vectorizer(_vectorizer_id);
+        -- count total items in the queue
+        select pg_catalog.format
+        ( $sql$select count(1) from (select 1 from %I.%I limit 501) $sql$
+        , _vec.queue_schema, _vec.queue_table
+        ) into strict _sql
+        ;
+        execute _sql into _count;
+        commit;
+        set local search_path = pg_catalog, pg_temp;
+        -- for every 50 items in the queue, execute a vectorizer max out at 10 vectorizers
+        _count = least(pg_catalog.ceil(_count::float8 / 50.0::float8), 10::float8)::bigint;
+        while _count > 0
+        loop
+            -- execute the vectorizer
+            perform ai.execute_vectorizer(_vectorizer_id);
+            _count = _count - 1;
+        end loop;
     end if;
     commit;
     set local search_path = pg_catalog, pg_temp;
@@ -2589,7 +2606,7 @@ begin
 
     -- get the source table's primary key definition
     select ai._vectorizer_source_pk(source) into strict _source_pk;
-    if pg_catalog.jsonb_array_length(_source_pk) = 0 then
+    if _source_pk is null or pg_catalog.jsonb_array_length(_source_pk) = 0 then
         raise exception 'source table must have a primary key constraint';
     end if;
 
